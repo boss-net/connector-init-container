@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cn.fullname" . }}
+  labels:
+{{ include "cn.labels" . | indent 4 }}
+{{- if .Values.additionalLabels -}}
+  {{- toYaml .Values.additionalLabels | nindent 4 }}
+{{- end }}
+spec:
+  serviceName: {{ include "cn.fullname" . }}
+  replicas: {{ .Values.connector.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "cn.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "cn.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- if .Values.additionalLabels -}}
+        {{- toYaml .Values.additionalLabels | nindent 8 }}
+        {{- end }}
+    {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
+    spec:
+    {{- if .Values.icmpSupport.enabled }}
+      securityContext:
+        sysctls:
+        - name: net.ipv4.ping_group_range
+          value: "0  2147483647"
+    {{- end }}
+      serviceAccountName: {{ include "cn.fullname" . }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          envFrom:
+            - secretRef:
+                name: {{ include "cn.fullname" . }}
+                optional: false
+          env:
+            - name: TWINGATE_URL
+              value: "https://{{ required "Account required" .Values.twingate.account }}"
+              {{- if .Values.connector.dnsServer }}
+            - name: TWINGATE_DNS
+              value: "{{ .Values.connector.dnsServer }}"
+              {{- end }}
+            - name: LOG_LEVEL
+              {{- if eq .Values.connector.logLevel "warning" }}
+              value: "4"
+              {{- else if eq .Values.connector.logLevel "info" }}
+              value: "6"
+              {{- else if eq .Values.connector.logLevel "debug" }}
+              value: "7"
+              {{- else }}
+              value: "3"
+              {{- end }}
+              {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+              {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      initContainers:
+        - name: "connector-provision"
+          image: ghcr.io/twingate-labs/connector-init-container:latest
+          envFrom:
+            - secretRef:
+                name: {{ include "cn.fullname" . }}
+                optional: false
+          env:
+            - name: TG_ACCOUNT
+              value: {{.Values.twingate.account }}
+          command: [ "/bin/bash", "-c" ]
+          args:
+            - |
+              offline_connectors=$(./tg connector list -o json | jq -c '[ .[] | select( .remoteNetworkLabel=="{{.Values.twingate.networkName }}") ]' |  jq -c '[ .[] | select( .state | contains("Offline")) ]');
+              if [[ $offline_connectors == "[]" ]]; then
+                new_connector=$(./tg connector create {{.Values.twingate.networkName }})
+                access_token=$(echo $new_connector | sed -e 's/.*ACCESS_TOKEN\=\(.*\)\ .*/\1/')
+                refresh_token="${new_connector##*REFRESH_TOKEN=}"
+              else
+                connector_id=$(echo $offline_connectors | jq -r '.[0].id')
+                connector_tokens=$(./tg connector generate_token $connector_id)
+                access_token=$(echo $connector_tokens | sed -e 's/.*ACCESS_TOKEN\=\(.*\)\ .*/\1/')
+                refresh_token="${connector_tokens##*REFRESH_TOKEN=}"
+              fi
+              kubectl get secret {{ include "cn.fullname" . }} -o json | jq --arg access_token_64 "$(echo -n $access_token | base64)" '.data["TWINGATE_ACCESS_TOKEN"]=$access_token_64' | kubectl apply -f -
+              kubectl get secret {{ include "cn.fullname" . }} -o json | jq --arg refresh_token_64 "$(echo -n $refresh_token | base64)" '.data["TWINGATE_REFRESH_TOKEN"]=$refresh_token_64' | kubectl apply -f -
+              sleep 5
+    {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 1
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/instance
+                    operator: In
+                    values:
+                      - {{ .Release.Name }}
+              topologyKey: kubernetes.io/hostname
+    {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+    {{- end }}
